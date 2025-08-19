@@ -1,0 +1,2793 @@
+---
+title: "Ames house price"
+author: "Tasmiah"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# 0. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(broom)
+library(car)        # vif
+library(MASS)       # stepAIC
+library(leaps)      # subset selection
+library(GGally)
+theme_set(theme_minimal())
+set.seed(42)
+```
+
+# 1. Load and prepare
+
+```{r}
+
+ames <- read.csv("C:/Users/ASUS/Desktop/OWN Invest/R projects with linear regression/AmesHousing.csv")
+attach(ames)
+View((ames))
+head(ames)
+
+# Drop IDs that shouldn't be modeled
+ames <- ames[, !(names(ames) %in% c("Order", "PID"))]
+
+# Convert all character columns to factor
+char_cols <- names(ames)[sapply(ames, is.character)]
+ames[char_cols] <- lapply(ames[char_cols], as.factor)
+
+# Confirm types
+str(ames)
+```
+
+# 2. Variable screening 
+
+We screen variables univariately against `SalePrice` and keep only strong candidates.  
+- Numeric: correlation test with SalePrice  
+- Categorical (factor): one-way ANOVA on SalePrice  
+
+# Numerical variables screening
+
+```{r}
+y <- ames$sale_price
+
+# Numeric variable screening with correlation and p-values
+num_cols <- names(ames)[sapply(ames, is.numeric)]
+num_cols <- setdiff(num_cols, "SalePrice")  # exclude response variable
+
+cor_results <- data.frame(
+  Variable = num_cols,
+  Correlation = sapply(num_cols, function(col) cor(ames[[col]], ames$SalePrice, use = "complete.obs")),
+  P_value = sapply(num_cols, function(col) cor.test(ames[[col]], ames$SalePrice)$p.value)
+)
+
+# Sort by absolute correlation first, then by p-value
+cor_results <- cor_results[order(abs(cor_results$Correlation), cor_results$P_value), ]
+
+selected_numeric <- subset(cor_results, abs(Correlation) > 0.1 & P_value < 0.2)
+selected_numeric
+
+```
+
+The most influential variables include Overall.Qual, Gr.Liv.Area, Garage.Cars, Garage.Area, Total.Bsmt.SF, X1st.Flr.SF, and Year.Built—all showing high positive correlations (>0.55) and clear interpretability in explaining property value.
+
+Secondary predictors such as Full.Bath, Year.Remod.Add, Garage.Yr.Blt, Mas.Vnr.Area, TotRms.AbvGrd, and Fireplaces contribute additional explanatory power, with moderate correlations (0.47–0.55) and relevance to property amenities and improvements.
+
+We will now screen the variables based on requirements and also the p value preference to select variables 
+
+```{r}
+selected_numeric1 <- subset(cor_results, abs(Correlation) > 0.30)
+print(selected_numeric1)
+```
+
+# Categorical variable screening
+
+```{r}
+
+# 2.2 Categorical screening (ANOVA)
+fac_cols <- names(ames)[sapply(ames, is.factor)]
+fac_screen <- purrr::map_dfr(fac_cols, function(v){
+  f <- as.formula(paste("SalePrice  ~", v))
+  a <- aov(f, data = ames)
+  tibble(var = v, type = "factor",
+         p = summary(a)[[1]][["Pr(>F)"]][1])
+}) %>% arrange(p)
+
+print(fac_screen)
+
+```
+
+
+# Targeted variables
+
+```{r}
+# Updated thresholds
+p_thresh_num <- 0.05   # numeric p-value cutoff
+p_thresh_fac <- 0.05   # categorical p-value cutoff
+
+# Keep only numeric variables meeting threshold
+keep_num <- selected_numeric1 %>%
+  filter(!is.na(P_value), P_value <= p_thresh_num) %>%
+  pull(Variable)
+
+# Keep only categorical variables meeting threshold
+keep_fac <- fac_screen %>%
+  filter(!is.na(p), p <= p_thresh_fac) %>%
+  pull(var)
+
+# Combine candidate variables
+candidates <- c(keep_num, keep_fac)
+candidates
+
+# Show count
+length(candidates)
+
+```
+
+# 3. EDA on shortlisted variables
+
+- Missing values handeling - imputation with median and mode based on skewness of numeric and categorical   
+- Numeric: histogram, Shapiro-Wilk, boxplot + outlier counts by IQR  
+- Relationship plots vs SalePrice (scatter for numeric, box for factor)
+
+```{r}
+library(ggplot2)
+
+# Keep only SalePrice and candidate variables
+eda_df <- ames[, c("SalePrice", candidates)]
+
+# Separate numeric and factor columns
+num_cols <- names(eda_df)[sapply(eda_df, is.numeric)]
+fac_cols <- names(eda_df)[sapply(eda_df, is.factor)]
+length(num_cols)
+length(fac_cols)
+
+num_cols
+fac_cols
+```
+
+# Missing values handeling
+
+```{r}
+# --- Missing counts ---
+sapply(eda_df, function(x) sum(is.na(x)))
+
+library(e1071)  # for skewness
+
+# --- Helper functions ---
+get_mode <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+impute_num <- function(x) {
+  sk <- skewness(x, na.rm = TRUE)
+  if(abs(sk) < 0.5) {
+    x[is.na(x)] <- mean(x, na.rm = TRUE)  # normal-ish → mean
+  } else {
+    x[is.na(x)] <- median(x, na.rm = TRUE)  # skewed → median
+  }
+  x
+}
+
+impute_cat <- function(x) {
+  x[is.na(x)] <- get_mode(x)
+  x
+}
+
+# --- 1) Drop columns with very high missingness (≥ 30%) ---
+miss_frac <- colSums(is.na(eda_df)) / nrow(eda_df)
+high_missing <- names(miss_frac[miss_frac >= 0.30])
+eda_df <- eda_df[, setdiff(names(eda_df), high_missing), drop = FALSE]
+
+cat("Dropped columns due to high missingness:\n"); print(high_missing)
+
+# --- 2) Special case: Lot.Frontage by Neighborhood median ---
+if(all(c("Lot.Frontage", "Neighborhood") %in% names(eda_df))) {
+  nb_med <- tapply(eda_df$Lot.Frontage, eda_df$Neighborhood, function(z) median(z, na.rm = TRUE))
+  idx <- is.na(eda_df$Lot.Frontage)
+  eda_df$Lot.Frontage[idx] <- nb_med[as.character(eda_df$Neighborhood[idx])]
+}
+
+# --- 3) Impute remaining variables ---
+for(col in names(eda_df)) {
+  if(is.numeric(eda_df[[col]])) {
+    eda_df[[col]] <- impute_num(eda_df[[col]])
+  } else if(is.character(eda_df[[col]]) || is.factor(eda_df[[col]])) {
+    eda_df[[col]] <- impute_cat(as.character(eda_df[[col]]))
+    eda_df[[col]] <- factor(eda_df[[col]])
+  }
+}
+
+# --- 4) Quick check for remaining NAs ---
+cat("\nRemaining NA counts :\n")
+print(sort(colSums(is.na(eda_df)), decreasing = TRUE))
+
+#eda_df
+
+```
+
+# Numerical Variable EDA
+
+```{r}
+# --- IQR outlier counts for numeric variables ---
+factor_val <- 3  # Change this to 2.5 or 3 as needed
+
+iqr_outliers <- sapply(num_cols, function(col) {
+  x <- eda_df[[col]]
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower <- Q1 - factor_val * IQR_val
+  upper <- Q3 + factor_val * IQR_val
+  sum(x < lower | x > upper, na.rm = TRUE)
+})
+
+iqr_outliers
+
+#use factor 3 to get the maximum details then justify which variables you want and which you want to remove 
+
+```
+# Histogram ,Scatterplot and Boxplot
+
+```{r}
+
+# --- Histograms (predictors only) ---
+for (col in num_cols) {
+  print(
+    ggplot(eda_df, aes(x = .data[[col]])) +
+      geom_histogram(bins = 30, color = "black") +
+      labs(title = paste("Histogram of", col), x = col, y = "Count")
+  )
+}
+
+# --- Scatterplots vs SalePrice ---
+for (col in num_cols) {
+  print(
+    ggplot(eda_df, aes(x = .data[[col]], y = SalePrice)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "red") +
+      labs(title = paste("SalePrice vs", col), x = col, y = "SalePrice")
+  )
+}
+
+# --- Boxplots for numeric predictors ---
+for (col in num_cols) {
+  print(
+    ggplot(eda_df, aes(y = .data[[col]])) +
+      geom_boxplot() +
+      labs(title = paste("Boxplot of", col), y = col)
+  )
+}
+
+
+
+```
+We observed six properties with SalePrice > 600,000, far beyond the typical range of 120,000–400,000 where 95% of sales lie. These outliers represent luxury homes atypical of the Ames market, and their inclusion caused high leverage in the regression (Cook’s Distance > threshold). Since our modeling objective is to capture the general housing price dynamics, we excluded these properties to improve model stability and generalizability.
+
+#Extreme rows of SalePrice
+
+```{r}
+
+summary(eda_df)
+# View rows where SalePrice > 600000
+extreme_rows <- eda_df[eda_df$SalePrice > 600000, ]
+print(extreme_rows)
+
+# Create a cleaned dataset without extreme SalePrice values
+eda_df_clean <- subset(eda_df, SalePrice <= 600000)
+
+# Check dimensions before and after
+dim(eda_df)        # before
+dim(eda_df_clean)  # after
+
+hist(eda_df_clean$SalePrice,
+     breaks = 30,
+     col = "gray",
+     main = "Histogram of SalePrice (Cleaned)",
+     xlab = "SalePrice")
+
+eda_df_clean = eda_df
+
+```
+
+# Ctaegorical Variable EDA
+
+```{r}
+
+# ---- Categorical EDA ----
+
+
+library(ggplot2)
+
+# Identify categorical columns among 57 selected variables
+char_cols <- names(eda_df)[sapply(eda_df, is.character) | sapply(eda_df, is.factor)]
+
+# 1. Counts per category
+for (col in char_cols) {
+  print(
+    ggplot(eda_df, aes(x = .data[[col]])) +
+      geom_bar(fill = "skyblue", color = "black") +
+      labs(title = paste("Count of", col), x = col, y = "Count") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  )
+}
+
+# 2. SalePrice by category
+for (col in char_cols) {
+  print(
+    ggplot(eda_df, aes(x = .data[[col]], y = SalePrice)) +
+      geom_boxplot(fill = "lightgreen") +
+      labs(title = paste("SalePrice by", col), x = col, y = "SalePrice") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  )
+}
+
+
+
+```
+
+
+# 4. Fit model with selected 51 variables and check multicolinearity - num 17 + cat 34 ( 3 removed for high missing values - Fireplace.Qu" "Alley" "Fence" ) - (4 removed due to na values - "BsmtFin.Type.1" "Exterior.2nd" "Garage.Cond"    "Bsmt.Cond" - as considered as bad terms )
+
+```{r}
+
+eda_df2 = eda_df_clean
+library(car)
+
+# Fit full model with 51 predictors
+
+model_full <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Garage.Finish + Heating.QC +
+    Garage.Type + Mas.Vnr.Type + Bsmt.Exposure + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive + Roof.Style + Central.Air +
+    House.Style  + Electrical + Land.Contour +
+    Condition.1 + Garage.Qual + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Functional + Roof.Matl + Heating + BsmtFin.Type.2 +
+    Land.Slope + Street,
+  data = eda_df2
+)
+
+summary(model_full)
+
+```
+# vif with numerical column - num 17 
+
+```{r}
+Modelnum <- lm(SalePrice ~ Open.Porch.SF+Wood.Deck.SF+Lot.Frontage+BsmtFin.SF.1+Fireplaces+TotRms.AbvGrd+Mas.Vnr.Area+Garage.Yr.Blt+Year.Remod.Add+Full.Bath+Year.Built+X1st.Flr.SF+Total.Bsmt.SF+Garage.Area+Garage.Cars+Gr.Liv.Area+Overall.Qual, data = eda_df2)
+ summary(Modelnum)
+```
+Open.Porch.SF,TotRms.AbvGrd ,Garage.Yr.Blt,Full.Bath  ,X1st.Flr.SF - these 5 variables are not significant .
+
+# Multicolinearity with 51 variables 
+
+```{r}
+library(car)
+
+raw_vif <- vif(model_full)
+
+vif_tbl <- if (is.matrix(raw_vif)) {
+  # multi‑df terms present
+  data.frame(
+    Term = rownames(raw_vif),
+    Df   = raw_vif[, "Df"],
+    VIF  = raw_vif[, "GVIF^(1/(2*Df))"],
+    row.names = NULL
+  )
+} else {
+  # all 1‑df terms
+  data.frame(
+    Term = names(raw_vif),
+    Df   = 1,
+    VIF  = unname(raw_vif)
+  )
+}
+
+vif_tbl
+
+```
+Here all variables have vif score less than 5 means none of them has multicolinearity.
+
+# individual model run with each variable
+
+```{r}
+eda_df= eda_df2
+
+# Model 1:
+model1 <- lm(SalePrice ~ Open.Porch.SF, data = eda_df)
+summary(model1)
+anova(model1, test = "F")
+
+# Model 2:
+model2 <- lm(SalePrice ~ Wood.Deck.SF, data = eda_df)
+summary(model2)
+
+# Model 3:
+model3 <- lm(SalePrice ~ Lot.Frontage, data = eda_df)
+summary(model3)
+
+# Model 4:
+model4 <- lm(SalePrice ~ BsmtFin.SF.1, data = eda_df)
+summary(model4)
+
+# Model 5:
+model5 <- lm(SalePrice ~ Fireplaces, data = eda_df)
+summary(model5)
+
+# Model 6:
+model6 <- lm(SalePrice ~ TotRms.AbvGrd, data = eda_df)
+summary(model6)
+
+# Model 7:
+model7 <- lm(SalePrice ~ Mas.Vnr.Area, data = eda_df)
+summary(model7)
+
+# Model 8:
+model8 <- lm(SalePrice ~ Garage.Yr.Blt, data = eda_df)
+summary(model8)
+
+# Model 9:
+model9 <- lm(SalePrice ~ Year.Remod.Add, data = eda_df)
+summary(model9)
+
+# Model 10:
+model10 <- lm(SalePrice ~ Full.Bath, data = eda_df)
+summary(model10)
+
+# Model 11:
+model11 <- lm(SalePrice ~ Year.Built, data = eda_df)
+summary(model11)
+
+# Model 12:
+model12 <- lm(SalePrice ~ X1st.Flr.SF, data = eda_df)
+summary(model12)
+
+# Model 13:
+model13 <- lm(SalePrice ~ Total.Bsmt.SF, data = eda_df)
+summary(model13)
+
+# Model 14:
+model14 <- lm(SalePrice ~ Garage.Area, data = eda_df)
+summary(model14)
+
+# Model 15:
+model15 <- lm(SalePrice ~ Garage.Cars, data = eda_df)
+summary(model15)
+
+# Model 16:
+model16 <- lm(SalePrice ~ Gr.Liv.Area, data = eda_df)
+summary(model16)
+
+# Model 17:
+model17 <- lm(SalePrice ~ Overall.Qual, data = eda_df)
+summary(model17)
+
+# Model 18:
+model18 <- lm(SalePrice ~ Neighborhood, data = eda_df)
+summary(model18)
+
+# Model 19:
+model19 <- lm(SalePrice ~ Exter.Qual, data = eda_df)
+summary(model19)
+
+# Model 20:
+model20 <- lm(SalePrice ~ Bsmt.Qual, data = eda_df)
+summary(model20)
+
+# Model 21:
+model21 <- lm(SalePrice ~ Kitchen.Qual, data = eda_df)
+summary(model21)
+
+# Model 22:
+model22 <- lm(SalePrice ~ Foundation, data = eda_df)
+summary(model22)
+
+# Model 23:
+model23 <- lm(SalePrice ~ Garage.Finish, data = eda_df)
+summary(model23)
+
+# Model 24:
+model24 <- lm(SalePrice ~ Heating.QC, data = eda_df)
+summary(model24)
+
+# Model 25:
+model26 <- lm(SalePrice ~ Garage.Type, data = eda_df)
+summary(model26)
+
+# Model 26:
+model27 <- lm(SalePrice ~ Mas.Vnr.Type, data = eda_df)
+summary(model27)
+
+# Model 27:
+model28 <- lm(SalePrice ~ Bsmt.Exposure, data = eda_df)
+summary(model28)
+
+# Model 28:
+model29 <- lm(SalePrice ~ Exterior.1st, data = eda_df)
+summary(model29)
+
+
+# Model 30:
+model31 <- lm(SalePrice ~ Sale.Condition, data = eda_df)
+summary(model31)
+
+# Model 31:
+model32 <- lm(SalePrice ~ Sale.Type, data = eda_df)
+summary(model32)
+
+# Model 32:
+model33 <- lm(SalePrice ~ MS.Zoning, data = eda_df)
+summary(model33)
+
+# Model 33:
+model34 <- lm(SalePrice ~ Lot.Shape, data = eda_df)
+summary(model34)
+
+# Model 34:
+model35 <- lm(SalePrice ~ Paved.Drive, data = eda_df)
+summary(model35)
+
+# Model 35:
+model36 <- lm(SalePrice ~ Roof.Style, data = eda_df)
+summary(model36)
+
+# Model 36:
+model37 <- lm(SalePrice ~ Central.Air, data = eda_df)
+summary(model37)
+
+# Model 37:
+model38 <- lm(SalePrice ~ House.Style, data = eda_df)
+summary(model38)
+
+
+# Model 38:
+model40 <- lm(SalePrice ~ Electrical, data = eda_df)
+summary(model40)
+
+# Model 39:
+model41 <- lm(SalePrice ~ Land.Contour, data = eda_df)
+summary(model41)
+
+# Model 40:
+model42 <- lm(SalePrice ~ Condition.1, data = eda_df)
+summary(model42)
+
+# Model 41:
+model43 <- lm(SalePrice ~ Garage.Qual, data = eda_df)
+summary(model43)
+
+# Model 42:
+model44 <- lm(SalePrice ~ Bldg.Type, data = eda_df)
+summary(model44)
+
+
+# Model 43:
+model47 <- lm(SalePrice ~ Exter.Cond, data = eda_df)
+summary(model47)
+
+
+# Model 44:
+model49 <- lm(SalePrice ~ Condition.2, data = eda_df)
+summary(model49)
+
+# Model 45:
+model50 <- lm(SalePrice ~ Lot.Config, data = eda_df)
+summary(model50)
+
+# Model 46:
+model51 <- lm(SalePrice ~ Functional, data = eda_df)
+summary(model51)
+
+# Model 47:
+model52 <- lm(SalePrice ~ Roof.Matl, data = eda_df)
+summary(model52)
+
+
+# Model 48:
+model54 <- lm(SalePrice ~ Heating, data = eda_df)
+summary(model54)
+
+# Model 49:
+model55 <- lm(SalePrice ~ BsmtFin.Type.2, data = eda_df)
+summary(model55)
+
+# Model 50:
+model56 <- lm(SalePrice ~ Land.Slope, data = eda_df)
+summary(model56)
+
+# Model 51:
+model57 <- lm(SalePrice ~ Street, data = eda_df)
+summary(model57)
+
+
+```
+# Model with significant variables - 41 variables based on 1% level of significance
+
+```{r}
+fullmodel1 <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+summary(fullmodel1)
+
+```
+# Purposeful selection by dropping each variable
+
+## anova
+
+#drop street
+
+**hypothesis**
+$H_0:$ The reduced model without street variable is significant.Street variable is not significant
+$H_a:$ The street variable is significant. 
+
+```{r}
+#model without street
+model_withoutstreet<- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope ,
+  data = eda_df
+)
+
+#summary(model_withoutstreet)
+anova(model_withoutstreet,fullmodel1)
+```
+Since p = 0.5553 > 0.05, we fail to reject H₀.Street variable is not significant.
+
+
+#drop land.slope
+**hypothesis**
+$H_0:$ The reduced model without Land.Slope variable is significant. Land.Slope variable is not significant
+$H_a:$ The Land.Slope variable is significant. 
+
+```{r}
+#model without land.slope
+model_withoutland.slope<- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config + Street,
+  data = eda_df
+)
+
+#summary(model_withoutland.slope)
+anova(model_withoutland.slope,fullmodel1)
+```
+Here p value < alpha. so we will reject the null . The model with Land.slope is significant.
+
+#drop Lot.Config
+**hypothesis**
+$H_0:$ The reduced model without Lot.Config variable is significant. Lot.Config variable is not significant
+$H_a:$ The Lot.Config variable is significant. 
+
+```{r}
+
+model_withoutLot.config <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutLot.config)
+anova(model_withoutLot.config,fullmodel1)
+
+```
+Here p value < alpha. so we will reject the null . The model with Lot.Config is significant.
+
+#drop  Condition.2
+**hypothesis**
+$H_0:$ The reduced model without Condition.2 variable is significant. Condition.2 variable is not significant
+$H_a:$ The Condition.2 variable is significant. 
+
+```{r}
+model_withoutCondition.2 <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond  + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutCondition.2)
+anova(model_withoutCondition.2,fullmodel1)
+
+```
+Here p value < alpha. so we will reject the null . The model with Condition.2 is significant.
+
+#drop Exter.Cond
+**hypothesis**
+$H_0:$ The reduced model without Exter.Cond variable is significant. Exter.Cond variable is not significant
+$H_a:$ The Exter.Cond variable is significant. 
+
+```{r}
+model_withoutExter.Cond <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutExter.Cond )
+anova(model_withoutExter.Cond , fullmodel1)
+
+```
+here p value < alpha. so we will reject the null . The model with Exter.Cond is significant.
+
+#drop Bldg.Type
+**hypothesis**
+$H_0:$ The reduced model without Bldg.Type variable is significant. Bldg.Type variable is not significant
+$H_a:$ The Bldg.Type variable is significant. 
+
+
+```{r}
+model_withoutBldg.Type <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutBldg.Type)
+anova(model_withoutBldg.Type,fullmodel1)
+```
+
+Here re p value < alpha. so we will reject the null . The model with Bldg.Type is significant.
+
+#drop Condition.1
+**hypothesis**
+$H_0:$ The reduced model without Condition.1 variable is significant. Condition.2 variable is not significant
+$H_a:$ The Condition.1 variable is significant.
+
+```{r}
+model_withoutCondition.1 <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutCondition.1)
+anova(model_withoutCondition.1,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Condition.1 is significant.
+
+#drop Land.Contour
+**hypothesis**
+$H_0:$ The reduced model without Land.Contour variable is significant. Land.Contour variable is not significant
+$H_a:$ The Land.Contour variable is significant. 
+
+```{r}
+model_withoutLand.Contour <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + 
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutLand.Contour)
+anova(model_withoutLand.Contour,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Land.Contour is significant.
+
+#drop House.Style
+**hypothesis**
+$H_0:$ The reduced model without House.Style variable is significant. House.Style variable is not significant
+$H_a:$ The House.Style variable is significant. 
+
+```{r}
+model_withoutHouse.Style <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutHouse.Style)
+anova(model_withoutHouse.Style,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with House.Style is significant.
+
+#drop Central.Air
+**hypothesis**
+$H_0:$ The reduced model without Central.Air variable is significant. Central.Air variable is not significant
+$H_a:$ The Central.Air variable is significant.
+
+```{r}
+model_withoutCentral.Air <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutCentral.Air)
+anova(model_withoutCentral.Air,fullmodel1)
+
+```
+
+Here p value > alpha. so we failed to reject the null . The  Central.Air is not significant.
+
+#drop Paved.Drive
+
+**hypothesis**
+$H_0:$ The reduced model without Paved.Drive variable is significant. Paved.Drive variable is not significant
+$H_a:$ The Paved.Drive variable is significant. 
+
+```{r}
+model_withoutPaved.Drive <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutPaved.Drive)
+anova(model_withoutPaved.Drive,fullmodel1)
+```
+
+Here p value > alpha. so we failed to reject the null . The  Paved.Drive is not significant.
+
+#drop Lot.Shape
+**hypothesis**
+$H_0:$ The reduced model without Lot.Shape variable is significant. Lot.Shape variable is not significant
+$H_a:$ The Lot.Shape variable is significant. 
+
+```{r}
+model_withoutLot.Shape <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutLot.Shape)
+anova(model_withoutLot.Shape,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Lot.Shape is significant.
+
+#drop MS.Zoning
+
+**hypothesis**
+$H_0:$ The reduced model without MS.Zoning variable is significant. MS.Zoning variable is not significant
+$H_a:$ The MS.Zoning variable is significant. 
+
+```{r}
+model_withoutMS.Zoning <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutMS.Zoning)
+anova(model_withoutMS.Zoning,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The MS.Zoning is not significant.
+
+#drop Sale.Type
+
+**hypothesis**
+$H_0:$ The reduced model without Sale.Type variable is significant. Sale.Type variable is not significant
+$H_a:$ The Sale.Type variable is significant.
+
+```{r}
+model_withoutSale.Type <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutSale.Type)
+anova(model_withoutSale.Type,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Sale.Type is not significant.
+
+#drop Sale.Condition
+
+**hypothesis**
+$H_0:$ The reduced model without Sale.Condition variable is significant. Sale.Condition variable is not significant
+$H_a:$ The Sale.Condition variable is significant.
+
+```{r}
+model_withoutSale.Condition <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutSale.Condition)
+anova(model_withoutSale.Condition,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The Sale.Condition is significant.
+
+#drop Exterior.1st
+**hypothesis**
+$H_0:$ The reduced model without Exterior.1st variable is significant. Exterior.1st variable is not significant
+$H_a:$ The Exterior.1st variable is significant. 
+
+```{r}
+model_withoutExterior.1st <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutExterior.1st)
+anova(model_withoutExterior.1st,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Exterior.1st is significant.
+
+#drop  Mas.Vnr.Type
+**hypothesis**
+$H_0:$ The reduced model without Mas.Vnr.Type variable is significant. Mas.Vnr.Type variable is not significant
+$H_a:$ The Mas.Vnr.Type variable is significant.
+
+```{r}
+model_withoutMas.Vnr.Type <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutMas.Vnr.Type)
+anova(model_withoutMas.Vnr.Type,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Mas.Vnr.Type is not significant.
+
+#drop Garage.Type
+
+**hypothesis**
+$H_0:$ The reduced model without Garage.Type variable is significant. Garage.Type variable is not significant
+$H_a:$ The Garage.Type variable is significant. 
+
+```{r}
+model_withoutGarage.Type <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+     Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutGarage.Type)
+anova(model_withoutGarage.Type,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Garage.Type is not significant.
+
+#drop Heating.QC
+
+**hypothesis**
+$H_0:$ The reduced model without Heating.QC variable is significant. Heating.QC variable is not significant
+$H_a:$ The Heating.QC variable is significant.
+
+```{r}
+model_withoutHeating.QC <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutHeating.QC)
+anova(model_withoutHeating.QC,fullmodel1)
+
+```
+
+Here p value > alpha. so we fail to reject the null . The Heating.QC is not significant.
+
+#drop Foundation
+
+**hypothesis**
+$H_0:$ The reduced model without Foundation variable is significant. Foundation variable is not significant
+$H_a:$ The Foundation variable is significant.
+
+```{r}
+model_withoutFoundation <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutFoundation)
+anova(model_withoutFoundation,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Foundation is not significant.
+
+#drop  Kitchen.Qual
+
+**hypothesis**
+$H_0:$ The reduced model without Kitchen.Qual variable is significant. Kitchen.Qual variable is not significant
+$H_a:$ The Kitchen.Qual variable is significant. 
+
+```{r}
+model_withoutKitchen.Qual <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutKitchen.Qual)
+anova(model_withoutKitchen.Qual,fullmodel1)
+```
+
+re p value < alpha. so we will reject the null . The model with Kitchen.Qual is significant.
+
+#drop Bsmt.Qual
+**hypothesis**
+$H_0:$ The reduced model without Bsmt.Qual variable is significant. Bsmt.Qual variable is not significant
+$H_a:$ The Bsmt.Qual variable is significant.
+
+```{r}
+
+# here full model1 has some rows with na values that's why we are locking the rows of eda_df and using mf instead of eda_df
+# fullmodel1 <- lm(SalePrice ~ ... + Bsmt.Qual + ..., data = eda_df, na.action = na.omit)
+
+# lock the row set used by fullmodel1
+mf <- model.frame(fullmodel1)
+
+# --- DROP Bsmt.Qual (same style, explicit formula) ---
+model_withoutBsmt.Qual <- lm(
+  SalePrice ~
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual + Neighborhood + Exter.Qual + Kitchen.Qual +
+    Foundation + Heating.QC + Garage.Type + Mas.Vnr.Type +
+    Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive + Central.Air + House.Style +
+    Land.Contour + Condition.1 + Bldg.Type + Exter.Cond +
+    Condition.2 + Lot.Config + Land.Slope + Street,
+  data = mf     # <- critical: same rows as fullmodel1
+)
+
+#summary(model_withoutBsmt.Qual)
+anova(model_withoutBsmt.Qual, fullmodel1)
+
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Bsmt.Qual is significant.
+
+#drop  Exter.Qual
+**hypothesis**
+$H_0:$ The reduced model without Exter.Qual variable is significant. Exter.Qual variable is not significant
+$H_a:$ The Exter.Qual variable is significant. 
+
+```{r}
+model_withoutExter.Qual <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood +  Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutExter.Qual)
+anova(model_withoutExter.Qual,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Exter.Qual is significant.
+
+#drop Neighborhood
+
+**hypothesis**
+$H_0:$ The reduced model without Neighborhood variable is significant. Neighborhood variable is not significant
+$H_a:$ The Neighborhood variable is significant. 
+
+```{r}
+model_withoutNeighborhood <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutNeighborhood)
+anova(model_withoutNeighborhood,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Neighborhood is significant.
+
+#drop Overall.Qual
+
+**hypothesis**
+$H_0:$ The reduced model without Overall.Qual variable is significant. Overall.Qual variable is not significant
+$H_a:$ The Overall.Qual variable is significant.
+
+```{r}
+
+model_withoutOverall.Qual <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutOverall.Qual)
+anova(model_withoutOverall.Qual,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Overall.Qual is significant.
+
+#drop Gr.Liv.Area
+
+**hypothesis**
+$H_0:$ The reduced model without Gr.Liv.Area variable is significant. Gr.Liv.Area variable is not significant
+$H_a:$ The Gr.Liv.Area variable is significant. 
+
+```{r}
+model_withoutGr.Liv.Area <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + 
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutGr.Liv.Area)
+anova(model_withoutGr.Liv.Area,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Gr.Liv.Area is significant.
+
+#drop Garage.Cars
+
+**hypothesis**
+$H_0:$ The reduced model without Garage.Cars variable is significant. Garage.Cars variable is not significant
+$H_a:$ The Garage.Cars variable is significant.
+
+```{r}
+model_withoutGarage.Cars <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutGarage.Cars)
+anova(model_withoutGarage.Cars,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Garage.Cars is significant.
+
+#drop Garage.Area
+
+**hypothesis**
+$H_0:$ The reduced model without Garage.Area variable is significant. Garage.Area variable is not significant
+$H_a:$ The Garage.Area variable is significant. 
+
+```{r}
+model_withoutGarage.Area <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF +  Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutGarage.Area)
+anova(model_withoutGarage.Area,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Garage.Area is not significant.
+
+#drop Total.Bsmt.SF
+
+**hypothesis**
+$H_0:$ The reduced model without Total.Bsmt.SF variable is significant. Total.Bsmt.SF variable is not significant
+$H_a:$ The Total.Bsmt.SF variable is significant.
+
+```{r}
+model_withoutTotal.Bsmt.SF <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutTotal.Bsmt.SF)
+anova(model_withoutTotal.Bsmt.SF,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The Total.Bsmt.SF is  significant.
+
+#drop X1st.Flr.SF
+
+**hypothesis**
+$H_0:$ The reduced model without X1st.Flr.SF variable is significant. X1st.Flr.SF variable is not significant
+$H_a:$ The X1st.Flr.SF variable is significant. 
+
+```{r}
+model_withoutX1st.Flr.SF <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutX1st.Flr.SF)
+anova(model_withoutX1st.Flr.SF,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with X1st.Flr.SF is significant.
+
+#drop  Year.Built
+
+**hypothesis**
+$H_0:$ The reduced model without Year.Built variable is significant. Year.Built variable is not significant
+$H_a:$ The Year.Built variable is significant. 
+
+```{r}
+model_withoutYear.Built <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutYear.Built)
+anova(model_withoutYear.Built,fullmodel1)
+
+```
+
+Here p value > alpha. so we fail to reject the null . The Year.Built is not significant.
+
+#drop Full.Bath
+
+**hypothesis**
+$H_0:$ The reduced model without Full.Bath variable is significant. Full.Bath variable is not significant
+$H_a:$ The Full.Bath variable is significant.
+
+```{r}
+model_withoutFull.Bath <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutFull.Bath)
+anova(model_withoutFull.Bath,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Full.Bath is not significant.
+
+#drop Year.Remod.Add
+
+**hypothesis**
+$H_0:$ The reduced model without Year.Remod.Add variable is significant. Year.Remod.Add variable is not significant
+$H_a:$ The Year.Remod.Add variable is significant. 
+
+```{r}
+model_withoutYear.Remod.Add <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+   Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutYear.Remod.Add)
+anova(model_withoutYear.Remod.Add,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Year.Remod.Add is significant.
+
+#drop Garage.Yr.Blt
+
+**hypothesis**
+$H_0:$ The reduced model without Garage.Yr.Blt variable is significant. Garage.Yr.Blt variable is not significant
+$H_a:$ The Garage.Yr.Blt variable is significant.
+
+```{r}
+
+# lock the row set used by fullmodel1
+mf <- model.frame(fullmodel1)
+
+model_withoutGarage.Yr.Blt <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = mf
+)
+
+#summary(model_withoutGarage.Yr.Blt)
+anova(model_withoutGarage.Yr.Blt,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Garage.Yr.Blt is not significant.
+
+
+#drop Mas.Vnr.Area
+
+**hypothesis**
+$H_0:$ The reduced model without Mas.Vnr.Area variable is significant. Mas.Vnr.Area variable is not significant
+$H_a:$ The Mas.Vnr.Area variable is significant.
+
+```{r}
+# lock the row set used by fullmodel1
+mf <- model.frame(fullmodel1)
+
+model_withoutMas.Vnr.Area <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd +  Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = mf
+)
+
+#summary(model_withoutMas.Vnr.Area)
+anova(model_withoutMas.Vnr.Area,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Mas.Vnr.Area is significant.
+
+#drop TotRms.AbvGrd
+
+**hypothesis**
+$H_0:$ The reduced model without TotRms.AbvGrd variable is significant. TotRms.AbvGrd variable is not significant
+$H_a:$ The TotRms.AbvGrd variable is significant. 
+
+```{r}
+model_withoutTotRms.AbvGrd <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutTotRms.AbvGrd)
+anova(model_withoutTotRms.AbvGrd,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The TotRms.AbvGrd is not significant.
+
+#drop Fireplaces
+
+**hypothesis**
+$H_0:$ The reduced model without Fireplaces variable is significant. Fireplaces variable is not significant
+$H_a:$ The Fireplaces variable is significant. 
+
+```{r}
+model_withoutFireplaces <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutFireplaces)
+anova(model_withoutFireplaces,fullmodel1)
+
+```
+
+Here p value < alpha. so we will reject the null . The model with Fireplaces is significant.
+
+#drop BsmtFin.SF.1
+
+**hypothesis**
+$H_0:$ The reduced model without BsmtFin.SF.1 variable is significant. BsmtFin.SF.1 variable is not significant
+$H_a:$ The BsmtFin.SF.1 variable is significant.
+
+
+```{r}
+model_withoutBsmtFin.SF.1 <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF + Lot.Frontage +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutBsmtFin.SF.1)
+anova(model_withoutBsmtFin.SF.1,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with BsmtFin.SF.1 is significant.
+
+
+#drop Lot.Frontage
+
+**hypothesis**
+$H_0:$ The reduced model without Lot.Frontage variable is significant. Lot.Frontage variable is not significant
+$H_a:$ The Lot.Frontage variable is significant. 
+
+
+```{r}
+# lock the row set used by fullmodel1
+mf <- model.frame(fullmodel1)
+
+model_withoutLot.Frontage <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Wood.Deck.SF +  BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = mf
+)
+
+#summary(model_withoutLot.Frontage)
+anova(model_withoutLot.Frontage,fullmodel1)
+```
+
+Here p value > alpha. so we fail to reject the null . The Lot.Frontage is not significant.
+
+#drop Wood.Deck.SF
+
+**hypothesis**
+$H_0:$ The reduced model without Wood.Deck.SF variable is significant. Wood.Deck.SF variable is not significant
+$H_a:$ The Wood.Deck.SF variable is significant.
+
+```{r}
+model_withoutWood.Deck.SF <- lm(
+  SalePrice ~ 
+    Open.Porch.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutWood.Deck.SF)
+anova(model_withoutWood.Deck.SF,fullmodel1)
+```
+
+Here p value < alpha. so we will reject the null . The model with Wood.Deck.SF is significant.
+
+
+#drop Open.Porch.SF
+**hypothesis**
+$H_0:$ The reduced model without Open.Porch.SF variable is significant. Open.Porch.SF variable is not significant
+$H_a:$ The Open.Porch.SF variable is significant. 
+
+```{r}
+model_withoutOpen.Porch.SF <- lm(
+  SalePrice ~ 
+    Wood.Deck.SF + Lot.Frontage + BsmtFin.SF.1 +
+    Fireplaces + TotRms.AbvGrd + Mas.Vnr.Area + Garage.Yr.Blt +
+    Year.Remod.Add + Full.Bath + Year.Built + X1st.Flr.SF +
+    Total.Bsmt.SF + Garage.Area + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Foundation + Heating.QC +
+    Garage.Type + Mas.Vnr.Type  + Exterior.1st + Sale.Condition + Sale.Type + MS.Zoning +
+    Lot.Shape + Paved.Drive  + Central.Air +
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope + Street,
+  data = eda_df
+)
+
+#summary(model_withoutOpen.Porch.SF)
+anova(model_withoutOpen.Porch.SF,fullmodel1)
+
+```
+
+Here p value > alpha. so we fail to reject the null . The Open.Porch.SF is not significant.
+
+here 18 variables from both Categorical(10) and Numerical(8) removed due to their non-significance during anova test. We got 25 variables now for our reduced model.
+
+#Reduced model with 25 variables
+
+```{r}
+reducedmodel1 <- lm(
+  SalePrice ~ 
+    Wood.Deck.SF + BsmtFin.SF.1 +
+    Fireplaces + Mas.Vnr.Area + 
+    Year.Remod.Add + X1st.Flr.SF +Total.Bsmt.SF +
+    Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Exterior.1st + Sale.Condition +Lot.Shape + 
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope ,
+  data = eda_df
+)
+
+
+summary(reducedmodel1)
+```
+
+# Multicolinearity with 25 variables 
+
+```{r}
+library(car)
+
+raw_vif <- vif(reducedmodel1)
+
+vif_tbl <- if (is.matrix(raw_vif)) {
+  # multi‑df terms present
+  data.frame(
+    Term = rownames(raw_vif),
+    Df   = raw_vif[, "Df"],
+    VIF  = raw_vif[, "GVIF^(1/(2*Df))"],
+    row.names = NULL
+  )
+} else {
+  # all 1‑df terms
+  data.frame(
+    Term = names(raw_vif),
+    Df   = 1,
+    VIF  = unname(raw_vif)
+  )
+}
+
+vif_tbl
+
+```
+
+# stepwise regression
+```{r}
+best_step = step(reducedmodel1,direction="both")
+best_step
+```
+
+All 25 variables are significant.
+
+#forward selection
+
+```{r}
+forwardstep = step(reducedmodel1, direction = "forward")
+forwardstep
+```
+
+All 25 variables are significant.
+
+#backward elemination
+
+```{r}
+best_step_bckwrd = step(reducedmodel1,direction="backward")
+best_step_bckwrd
+```
+
+All 25 variables are significant.
+
+## Best Subset
+```{r}
+## Best Subset (restricted variable set)
+library(leaps)
+
+# design matrix for only your chosen predictors
+X <- model.matrix(
+  SalePrice ~ 
+    Wood.Deck.SF + BsmtFin.SF.1 +
+    Fireplaces + Mas.Vnr.Area + 
+    Year.Remod.Add + X1st.Flr.SF +Total.Bsmt.SF +
+    Garage.Cars + Gr.Liv.Area +
+    Overall.Qual +Neighborhood + Exter.Qual + Bsmt.Qual + Kitchen.Qual +
+    Exterior.1st + Sale.Condition +Lot.Shape + 
+    House.Style   + Land.Contour +
+    Condition.1 + Bldg.Type + Exter.Cond + Condition.2 + Lot.Config +
+    Land.Slope ,
+  data = eda_df
+)[, -1]
+
+y <- eda_df$SalePrice
+
+Model <- regsubsets(
+  x = X, y = y,
+  nvmax = ncol(X),      # maximum = number of predictors in this X
+  method = "forward"
+)
+
+summary(Model)
+
+SUM <- summary(Model)
+names(SUM)
+
+RSQ   <- SUM$rsq
+CP    <- SUM$cp
+ADRSq <- SUM$adjr2
+BIC   <- SUM$bic
+RSS   <- SUM$rss
+
+## AIC (comparable up to a constant)
+n <- nrow(X)
+p <- apply(SUM$which, 1, sum)
+I <- p
+AIC <- n*log(RSS/n) + 2*I
+
+## MSE
+MSE1 <- RSS / (n - I)
+
+## Plot
+par(mfrow = c(2, 2))
+plot(p, ADRSq, xlab = "Subset size", ylab = "Adjusted R-squared", pch = 19, col = "blue"); lines(p, ADRSq)
+plot(p, RSQ,  xlab = "Subset size", ylab = "R-squared",        pch = 19, col = "blue"); lines(p, RSQ)
+plot(p, CP,   xlab = "Subset size", ylab = "Cp",               pch = 19, col = "blue"); abline(h = min(CP,  na.rm = TRUE),  lty = 2)
+plot(p, BIC,  xlab = "Subset size", ylab = "BIC",              pch = 19, col = "blue"); abline(h = min(BIC, na.rm = TRUE), lty = 2)
+
+```
+
+
+```{r}
+# --- variable order (add in this sequence) ---
+vars <- c(
+  "Wood.Deck.SF","BsmtFin.SF.1","Fireplaces","Mas.Vnr.Area",
+  "Year.Remod.Add","X1st.Flr.SF","Total.Bsmt.SF","Garage.Cars",
+  "Gr.Liv.Area","Overall.Qual","Neighborhood","Exter.Qual","Bsmt.Qual",
+  "Kitchen.Qual","Exterior.1st","Sale.Condition","Lot.Shape",
+  "House.Style","Land.Contour","Condition.1","Bldg.Type","Exter.Cond",
+  "Condition.2","Lot.Config","Land.Slope"
+)
+
+# --- build nested models m1..mK in the given order ---
+models <- lapply(seq_along(vars), function(i) {
+  fm <- as.formula(paste("SalePrice ~", paste(vars[1:i], collapse = " + ")))
+  lm(fm, data = eda_df)
+})
+
+# --- helper stats (PRESS, RSS, R^2, AdjR^2, AIC, BIC, Cp, MSE) ---
+press_stat <- function(mod) {
+  r <- residuals(mod)
+  h <- hatvalues(mod)
+  sum((r / (1 - h))^2)
+}
+RSS  <- sapply(models, function(m) sum(residuals(m)^2))
+RSq  <- sapply(models, function(m) summary(m)$r.squared)
+AdRsq<- sapply(models, function(m) summary(m)$adj.r.squared)
+AICv <- sapply(models, AIC)
+BICv <- sapply(models, BIC)
+PRESS<- sapply(models, press_stat)
+MSE  <- sapply(models, function(m) summary(m)$sigma^2)
+
+# Mallows Cp: uses full model MSE (last model in the list)
+n        <- nobs(models[[length(models)]])
+sigma2_f <- MSE[length(models)]
+p_vec    <- sapply(models, function(m) length(coef(m)))  # includes intercept
+CP       <- RSS / sigma2_f - (n - 2 * p_vec)
+
+# --- flag matrix for included terms in each model ---
+all_vars <- vars
+xflags <- t(sapply(models, function(mod) {
+  as.integer(all_vars %in% attr(terms(mod), "term.labels"))
+}))
+colnames(xflags) <- all_vars
+rownames(xflags) <- seq_len(nrow(xflags))
+
+# --- final table (flags + metrics) ---
+out_tbl <- cbind(
+  xflags,
+  RSq = round(RSq, 7),
+  AdRsq = round(AdRsq, 7),
+  CP = round(CP, 7),
+  BIC = round(BICv, 7),
+  RSS = round(RSS, 7),
+  AIC = round(AICv, 7),
+  PRESS = round(PRESS, 2),
+  MSE = round(MSE, 2)
+)
+
+out_tbl
+
+```
+
+We selected subset 19 and 20 from above.
+
+# Anova between 19 & 20
+
+```{r}
+model19 <- lm(SalePrice~Wood.Deck.SF+ BsmtFin.SF.1+ Fireplaces+ Mas.Vnr.Area+ Year.Remod.Add +X1st.Flr.SF+ Total.Bsmt.SF+ Garage.Cars+ Gr.Liv.Area+ Overall.Qual+ Neighborhood+ Exter.Qual+ Bsmt.Qual+ Kitchen.Qual+ Exterior.1st+ Sale.Condition+ Lot.Shape+ House.Style+ Land.Contour, data = eda_df)
+
+model20 <- lm(SalePrice~Wood.Deck.SF+ BsmtFin.SF.1+ Fireplaces+ Mas.Vnr.Area+ Year.Remod.Add +X1st.Flr.SF+ Total.Bsmt.SF+ Garage.Cars+ Gr.Liv.Area+ Overall.Qual+ Neighborhood+ Exter.Qual+ Bsmt.Qual+ Kitchen.Qual+ Exterior.1st+ Sale.Condition+ Lot.Shape+ House.Style+ Land.Contour+ Condition.1, data= eda_df)
+
+anova(model19,model20)
+
+```
+
+Here model20 is the best subset as per the anova test.
+
+```{r}
+model20 <- lm(SalePrice~Wood.Deck.SF+ BsmtFin.SF.1+ Fireplaces+ Mas.Vnr.Area+ Year.Remod.Add +X1st.Flr.SF+ Total.Bsmt.SF+ Garage.Cars+ Gr.Liv.Area+ Overall.Qual+ Neighborhood+ Exter.Qual+ Bsmt.Qual+ Kitchen.Qual+ Exterior.1st+ Sale.Condition+ Lot.Shape+ House.Style+ Land.Contour+ Condition.1, data= eda_df)
+summary(model20)
+```
+
+As Bsmt.Qual is not significant, we are getting rid of this from model 20.
+
+```{r}
+model20_1 <- lm(SalePrice~Wood.Deck.SF+ BsmtFin.SF.1+ Fireplaces+ Mas.Vnr.Area+ Year.Remod.Add +X1st.Flr.SF+ Total.Bsmt.SF+ Garage.Cars+ Gr.Liv.Area+ Overall.Qual+ Neighborhood+ Exter.Qual+ Kitchen.Qual+ Exterior.1st+ Sale.Condition+ Lot.Shape+ House.Style+ Land.Contour+ Condition.1, data= eda_df)
+summary(model20_1)
+
+```
+
+So this Neighborhood, Exterior.1st,Condition.1 - we will create the dummy variables and get rid of the levels which are not significant as most of the levels are non significant.
+
+#creating dummy variables for Neighborhood, Exterior.1st, Condition.1
+
+```{r}
+# --- Neighborhood dummy variables ---
+eda_df$Nbhd_Blueste   <- ifelse(eda_df$Neighborhood == "Blueste", 1, 0)
+eda_df$Nbhd_BrDale    <- ifelse(eda_df$Neighborhood == "BrDale", 1, 0)
+eda_df$Nbhd_BrkSide   <- ifelse(eda_df$Neighborhood == "BrkSide", 1, 0)
+eda_df$Nbhd_ClearCr   <- ifelse(eda_df$Neighborhood == "ClearCr", 1, 0)
+eda_df$Nbhd_CollgCr   <- ifelse(eda_df$Neighborhood == "CollgCr", 1, 0)
+eda_df$Nbhd_Crawfor   <- ifelse(eda_df$Neighborhood == "Crawfor", 1, 0)
+eda_df$Nbhd_Edwards   <- ifelse(eda_df$Neighborhood == "Edwards", 1, 0)
+eda_df$Nbhd_Gilbert   <- ifelse(eda_df$Neighborhood == "Gilbert", 1, 0)
+eda_df$Nbhd_Greens    <- ifelse(eda_df$Neighborhood == "Greens", 1, 0)
+eda_df$Nbhd_GrnHill   <- ifelse(eda_df$Neighborhood == "GrnHill", 1, 0)
+eda_df$Nbhd_IDOTRR    <- ifelse(eda_df$Neighborhood == "IDOTRR", 1, 0)
+eda_df$Nbhd_Landmrk   <- ifelse(eda_df$Neighborhood == "Landmrk", 1, 0)
+eda_df$Nbhd_MeadowV   <- ifelse(eda_df$Neighborhood == "MeadowV", 1, 0)
+eda_df$Nbhd_Mitchel   <- ifelse(eda_df$Neighborhood == "Mitchel", 1, 0)
+eda_df$Nbhd_NAmes     <- ifelse(eda_df$Neighborhood == "NAmes", 1, 0)
+eda_df$Nbhd_NoRidge   <- ifelse(eda_df$Neighborhood == "NoRidge", 1, 0)
+eda_df$Nbhd_NPkVill   <- ifelse(eda_df$Neighborhood == "NPkVill", 1, 0)
+eda_df$Nbhd_NridgHt   <- ifelse(eda_df$Neighborhood == "NridgHt", 1, 0)
+eda_df$Nbhd_OldTown   <- ifelse(eda_df$Neighborhood == "OldTown", 1, 0)
+eda_df$Nbhd_Sawyer    <- ifelse(eda_df$Neighborhood == "Sawyer", 1, 0)
+eda_df$Nbhd_SawyerW   <- ifelse(eda_df$Neighborhood == "SawyerW", 1, 0)
+eda_df$Nbhd_Somerst   <- ifelse(eda_df$Neighborhood == "Somerst", 1, 0)
+eda_df$Nbhd_StoneBr   <- ifelse(eda_df$Neighborhood == "StoneBr", 1, 0)
+eda_df$Nbhd_SWISU     <- ifelse(eda_df$Neighborhood == "SWISU", 1, 0)
+eda_df$Nbhd_Timber    <- ifelse(eda_df$Neighborhood == "Timber", 1, 0)
+eda_df$Nbhd_Veenker   <- ifelse(eda_df$Neighborhood == "Veenker", 1, 0)
+
+# --- Exterior.1st dummy variables ---
+eda_df$Ext_AsphShn  <- ifelse(eda_df$Exterior.1st == "AsphShn", 1, 0)
+eda_df$Ext_BrkComm  <- ifelse(eda_df$Exterior.1st == "BrkComm", 1, 0)
+eda_df$Ext_BrkFace  <- ifelse(eda_df$Exterior.1st == "BrkFace", 1, 0)
+eda_df$Ext_CBlock   <- ifelse(eda_df$Exterior.1st == "CBlock", 1, 0)
+eda_df$Ext_CemntBd  <- ifelse(eda_df$Exterior.1st == "CemntBd", 1, 0)
+eda_df$Ext_HdBoard  <- ifelse(eda_df$Exterior.1st == "HdBoard", 1, 0)
+eda_df$Ext_ImStucc  <- ifelse(eda_df$Exterior.1st == "ImStucc", 1, 0)
+eda_df$Ext_MetalSd  <- ifelse(eda_df$Exterior.1st == "MetalSd", 1, 0)
+eda_df$Ext_Plywood  <- ifelse(eda_df$Exterior.1st == "Plywood", 1, 0)
+eda_df$Ext_PreCast  <- ifelse(eda_df$Exterior.1st == "PreCast", 1, 0)
+eda_df$Ext_Stone    <- ifelse(eda_df$Exterior.1st == "Stone", 1, 0)
+eda_df$Ext_Stucco   <- ifelse(eda_df$Exterior.1st == "Stucco", 1, 0)
+eda_df$Ext_VinylSd  <- ifelse(eda_df$Exterior.1st == "VinylSd", 1, 0)
+eda_df$Ext_WdSdng   <- ifelse(eda_df$Exterior.1st == "Wd Sdng", 1, 0)
+eda_df$Ext_WdShing  <- ifelse(eda_df$Exterior.1st == "WdShing", 1, 0)
+
+# --- Condition.1 dummy variables ---
+eda_df$Cond_Feedr  <- ifelse(eda_df$Condition.1 == "Feedr", 1, 0)
+eda_df$Cond_Norm   <- ifelse(eda_df$Condition.1 == "Norm", 1, 0)
+eda_df$Cond_PosA   <- ifelse(eda_df$Condition.1 == "PosA", 1, 0)
+eda_df$Cond_PosN   <- ifelse(eda_df$Condition.1 == "PosN", 1, 0)
+eda_df$Cond_RRAe   <- ifelse(eda_df$Condition.1 == "RRAe", 1, 0)
+eda_df$Cond_RRAn   <- ifelse(eda_df$Condition.1 == "RRAn", 1, 0)
+eda_df$Cond_RRNn   <- ifelse(eda_df$Condition.1 == "RRNn", 1, 0)
+eda_df$Cond_RRNe   <- ifelse(eda_df$Condition.1 == "RRNe", 1, 0)
+
+```
+
+
+# model with 3 variables dummy 
+```{r}
+model20_dummies <- lm(
+  SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces + Mas.Vnr.Area +
+    Year.Remod.Add + X1st.Flr.SF + Total.Bsmt.SF + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual + Exter.Qual + Kitchen.Qual + Sale.Condition + Lot.Shape +
+    House.Style + Land.Contour +
+
+    # --- Neighborhood dummies ---
+    Nbhd_Blueste + Nbhd_BrDale + Nbhd_BrkSide + Nbhd_ClearCr + Nbhd_CollgCr +
+    Nbhd_Crawfor + Nbhd_Edwards + Nbhd_Gilbert + Nbhd_Greens + Nbhd_GrnHill +
+    Nbhd_IDOTRR + Nbhd_Landmrk + Nbhd_MeadowV + Nbhd_Mitchel + Nbhd_NAmes +
+    Nbhd_NoRidge + Nbhd_NPkVill + Nbhd_NridgHt + Nbhd_OldTown + Nbhd_Sawyer +
+    Nbhd_SawyerW + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_SWISU + Nbhd_Timber +
+    Nbhd_Veenker +
+
+    # --- Exterior.1st dummies ---
+    Ext_AsphShn + Ext_BrkComm + Ext_BrkFace + Ext_CBlock + Ext_CemntBd +
+    Ext_HdBoard + Ext_ImStucc + Ext_MetalSd + Ext_Plywood + Ext_PreCast +
+    Ext_Stone + Ext_Stucco + Ext_VinylSd + Ext_WdSdng + Ext_WdShing +
+
+    # --- Condition.1 dummies ---
+    Cond_Feedr + Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAe +
+    Cond_RRAn + Cond_RRNe + Cond_RRNn,
+
+  data = eda_df
+)
+summary(model20_dummies)
+```
+
+# models with the significant variables of model20_dummies
+
+```{r}
+model20_dummies_1 <- lm(
+  SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces + Mas.Vnr.Area +
+    Year.Remod.Add + X1st.Flr.SF + Total.Bsmt.SF + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual + Exter.Qual + Kitchen.Qual + Sale.Condition + Lot.Shape +
+    House.Style + Land.Contour +
+
+    # --- Neighborhood dummies ---
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr +
+    Nbhd_Crawfor +  Nbhd_GrnHill +
+    Nbhd_NoRidge +  Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Nbhd_Veenker +
+
+    # --- Exterior.1st dummies ---
+     Ext_BrkFace + Ext_PreCast+
+
+    # --- Condition.1 dummies ---
+    Cond_Norm + Cond_PosA + Cond_PosN + 
+    Cond_RRAn ,
+
+  data = eda_df
+)
+
+summary(model20_dummies_1)
+
+```
+
+#creating dummy variables for Sale.Condition, House.Style, Kitchen.Qual
+```{r}
+# --- Sale.Condition dummy variables ---
+eda_df$SaleCond_AdjLand  <- ifelse(eda_df$Sale.Condition == "AdjLand", 1, 0)
+eda_df$SaleCond_Alloca   <- ifelse(eda_df$Sale.Condition == "Alloca", 1, 0)
+eda_df$SaleCond_Family   <- ifelse(eda_df$Sale.Condition == "Family", 1, 0)
+eda_df$SaleCond_Normal   <- ifelse(eda_df$Sale.Condition == "Normal", 1, 0)
+eda_df$SaleCond_Partial  <- ifelse(eda_df$Sale.Condition == "Partial", 1, 0)
+
+# --- House.Style dummy variables ---
+eda_df$HS_1.5Unf   <- ifelse(eda_df$House.Style == "1.5Unf", 1, 0)
+eda_df$HS_1Story   <- ifelse(eda_df$House.Style == "1Story", 1, 0)
+eda_df$HS_2.5Fin   <- ifelse(eda_df$House.Style == "2.5Fin", 1, 0)
+eda_df$HS_2.5Unf   <- ifelse(eda_df$House.Style == "2.5Unf", 1, 0)
+eda_df$HS_2Story   <- ifelse(eda_df$House.Style == "2Story", 1, 0)
+eda_df$HS_Foyer    <- ifelse(eda_df$House.Style == "SFoyer", 1, 0)
+eda_df$HS_SLvl     <- ifelse(eda_df$House.Style == "SLvl", 1, 0)
+
+# --- Kitchen.Qual dummy variables ---
+eda_df$KQ_Fa <- ifelse(eda_df$Kitchen.Qual == "Fa", 1, 0)
+eda_df$KQ_Gd <- ifelse(eda_df$Kitchen.Qual == "Gd", 1, 0)
+eda_df$KQ_Po <- ifelse(eda_df$Kitchen.Qual == "Po", 1, 0)
+eda_df$KQ_TA <- ifelse(eda_df$Kitchen.Qual == "TA", 1, 0)
+
+
+```
+
+
+# base model with significant numerical and categorical definite dummy variables - with the variables model20_dummies_1
+
+```{r}
+model20_dummies_2 <- lm(
+  SalePrice ~
+    Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces + Mas.Vnr.Area +
+    Year.Remod.Add + X1st.Flr.SF + Total.Bsmt.SF + Garage.Cars + Gr.Liv.Area +
+    Overall.Qual + Exter.Qual + 
+    
+    # --- Kitchen.Quality dummies (baseline = level not coded, e.g., Ex) ---
+    KQ_Fa + KQ_Gd+ KQ_TA+
+    
+    # --- Sale.Condition dummies (baseline = level not coded, e.g., Abnorml) ---
+    SaleCond_Normal + SaleCond_Partial +
+    
+    Lot.Shape +
+    
+    # --- House.Style dummies (baseline = level not coded, e.g., 1.5Fin) ---
+    HS_1.5Unf + HS_1Story + HS_2.5Unf + HS_2Story + HS_Foyer + HS_SLvl +
+    
+    Land.Contour +
+    
+    # --- Neighborhood dummies (your kept set) ---
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    
+    
+    # --- Exterior.1st dummies ---
+    Ext_BrkFace + Ext_PreCast +
+    
+    # --- Condition.1 dummies ---
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  
+  data = eda_df
+)
+
+summary(model20_dummies_2)
+
+base_model = model20_dummies_2
+```
+
+# Multicolinearity with the base model - model20_dummies_2
+
+
+```{r}
+library(car)
+
+raw_vif <- vif(base_model)
+
+vif_tbl <- if (is.matrix(raw_vif)) {
+  # multi‑df terms present
+  data.frame(
+    Term = rownames(raw_vif),
+    Df   = raw_vif[, "Df"],
+    VIF  = raw_vif[, "GVIF^(1/(2*Df))"],
+    row.names = NULL
+  )
+} else {
+  # all 1‑df terms
+  data.frame(
+    Term = names(raw_vif),
+    Df   = 1,
+    VIF  = unname(raw_vif)
+  )
+}
+
+vif_tbl
+
+```
+
+
+#Matrix plot - with numerical variable - "Garage.Cars", "Fireplaces", "Overall.Qual"- ordinal values thats why we are getting rid of the variables in scatterplot 
+```{r}
+library(PerformanceAnalytics)
+
+# Select only the variables from your model
+vars_model <- c(
+  "Wood.Deck.SF", "BsmtFin.SF.1", "Mas.Vnr.Area", 
+  "Year.Remod.Add", "X1st.Flr.SF", "Total.Bsmt.SF", 
+  "Gr.Liv.Area"
+)
+
+# Create correlation matrix plot
+chart.Correlation(
+  eda_df[, vars_model],
+  histogram = TRUE,
+  pch = 19,
+  main = "Scatterplot Matrix of Predictors in SalePrice Model"
+)
+
+
+```
+
+#Transformation of the numerical variables which we have in base model
+
+# we are trying with log(1 + x), log, sqrt, orginal value here 
+
+```{r}
+# Create transformed variables
+eda_df$log_SalePrice  <- sqrt(eda_df$SalePrice)
+#eda_df$log_WoodDeck   <- sqrt(eda_df$Wood.Deck.SF)
+#eda_df$log_MasVnr     <- sqrt(eda_df$Mas.Vnr.Area)
+eda_df$log_TotalBsmt  <- sqrt(eda_df$Total.Bsmt.SF)
+#eda_df$log_GrLivArea  <- sqrt(eda_df$Gr.Liv.Area)
+#eda_df$log_1stFlr     <- sqrt(eda_df$X1st.Flr.SF)
+#eda_df$YearRemod_C    <- eda_df$Year.Remod.Add - 1950
+
+# we used Mas.Vnr.Area, X1st.Flr.SF in orginal as using log and sqrt form doesn't increase any r square values , sqrt(Total.Bsmt.SF) also increased the r squared, Wood.Deck.SF is also increased the r squared .Gr.Liv.Area is also increased the r squared
+
+# Refit model with transformed variables
+model_base_trans <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+    Mas.Vnr.Area + Year.Remod.Add + X1st.Flr.SF + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot.Shape +
+    HS_1Story + HS_2.5Unf + HS_Foyer + HS_SLvl +
+    Land.Contour +
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Ext_BrkFace + Ext_PreCast +
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  data = eda_df
+)
+
+summary(model_base_trans)
+```
+
+With this model we get the highest r squared values while doing the transformation of SalePrice and Total.Bsmt.SF with sqrt. We are keeping Mas.Vnr.Area as the p value is 0.05
+
+
+Our goal is to find out the linear model possible. So we can't think interaction here. So we will go with this model and then check the validation and assumptions on this model.
+
+# final model
+
+```{r}
+final_model <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+    Mas.Vnr.Area + Year.Remod.Add + X1st.Flr.SF + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot.Shape +
+    HS_1Story + HS_2.5Unf + HS_Foyer + HS_SLvl +
+    Land.Contour +
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Ext_BrkFace + Ext_PreCast +
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  data = eda_df
+)
+
+summary(final_model)
+
+```
+
+We are keeping Mas.Vnr.Area as the p value here is marginal.
+# matrix plot
+
+```{r}
+library(PerformanceAnalytics)
+
+# select only the numerical predictors from final_model
+df_final_nums <- eda_df[, c("log_SalePrice",
+  "Wood.Deck.SF", "BsmtFin.SF.1",
+  "Mas.Vnr.Area", "Year.Remod.Add", "X1st.Flr.SF", "log_TotalBsmt",
+   "Gr.Liv.Area"
+)]
+
+# create correlation scatterplot matrix
+chart.Correlation(
+  df_final_nums,
+  histogram = TRUE,
+  pch = 19,
+  main = "Scatterplot Matrix of Numerical Predictors in Final Model"
+)
+
+
+```
+
+```{r}
+# Adding predicted and observed values (log scale)
+eda_df$predicted_log_SalePrice <- predict(final_model)
+eda_df$observed_log_SalePrice <- eda_df$log_SalePrice
+
+# making a comparison table
+comparison_df = data.frame(
+  Observed = eda_df$observed_log_SalePrice,
+  Predicted = eda_df$predicted_log_SalePrice,
+  residuals = eda_df$observed_log_SalePrice - eda_df$predicted_log_SalePrice
+)
+comparison_df
+
+# residuals plot
+plot(eda_df$observed_log_SalePrice, comparison_df$residuals, pch=19, col="blue",
+     xlab = "Fitted Values",
+     ylab  = "Residuals",
+     main= "Residuals vs Fitted")
+abline(h=0, lty="dashed", col="red")
+
+
+```
+
+
+The residual plot shows that the residuals are generally centered around zero, supporting the linearity assumption of the model. Most points are randomly scattered, with no strong systematic pattern, which indicates that the model fits the data reasonably well. However, there are a few noticeable outliers with large negative residuals, and the spread of residuals increases slightly for higher fitted values, suggesting mild heteroscedasticity. Overall, the model is appropriate, but attention to influential points and variance consistency may further improve its performance.
+
+
+```{r}
+
+# Ploting observed vs. predicted values (log scale)
+plot(eda_df$observed_log_SalePrice,eda_df$predicted_log_SalePrice,
+     xlab = "Observed log(SalePrice)",
+     ylab = "Predicted log(SalePrice)",
+     main = "Observed vs. Predicted Values (Log Scale)",
+     col = "blue", pch = 19)
+abline(0, 1, col = "red", lwd = 2)
+
+```
+
+This observed vs. predicted plot (on the log scale) shows that most data points cluster closely around the red diagonal line, demonstrating strong agreement between observed and predicted log(SalePrice) values. The close alignment indicates that the model captures the underlying relationship well, with minimal systematic bias. While a few points deviate more noticeably—especially at the higher fitted values—the overall pattern confirms that the predictions are accurate and consistent.
+
+```{r}
+leverage <- round(hatvalues(final_model),3)
+StanRes <- round(rstandard(final_model),3)
+residual <- round(final_model$residuals,3)
+cd <- round(cooks.distance(final_model),3)
+Rstudent=round(rstudent(final_model),5)
+
+A=cbind(
+  log_SalePrice = eda_df$log_SalePrice,
+  Wood.Deck.SF = eda_df$Wood.Deck.SF,
+  BsmtFin.SF.1 = eda_df$BsmtFin.SF.1,
+  Fireplaces = eda_df$Fireplaces,
+  Mas.Vnr.Area = eda_df$Mas.Vnr.Area,
+  Year.Remod.Add = eda_df$Year.Remod.Add,
+  X1st.Flr.SF = eda_df$X1st.Flr.SF,
+  log_TotalBsmt = eda_df$log_TotalBsmt,
+  Garage.Cars = eda_df$Garage.Cars,
+  Gr.Liv.Area = eda_df$Gr.Liv.Area,
+  Overall.Qual = eda_df$Overall.Qual,
+  Exter.Qual = eda_df$Exter.Qual,
+  KQ_Fa = eda_df$KQ_Fa,
+  KQ_Gd = eda_df$KQ_Gd,
+  KQ_TA = eda_df$KQ_TA,
+  SaleCond_Normal = eda_df$SaleCond_Normal,
+  SaleCond_Partial = eda_df$SaleCond_Partial,
+  Lot.Shape = eda_df$Lot.Shape,
+  HS_1Story = eda_df$HS_1Story,
+  HS_2.5Unf = eda_df$HS_2.5Unf,
+  HS_Foyer = eda_df$HS_Foyer,
+  HS_SLvl = eda_df$HS_SLvl,
+  Land.Contour = eda_df$Land.Contour,
+  Nbhd_BrDale = eda_df$Nbhd_BrDale,
+  Nbhd_ClearCr = eda_df$Nbhd_ClearCr,
+  Nbhd_CollgCr = eda_df$Nbhd_CollgCr,
+  Nbhd_Crawfor = eda_df$Nbhd_Crawfor,
+  Nbhd_GrnHill = eda_df$Nbhd_GrnHill,
+  Nbhd_NoRidge = eda_df$Nbhd_NoRidge,
+  Nbhd_NridgHt = eda_df$Nbhd_NridgHt,
+  Nbhd_Somerst = eda_df$Nbhd_Somerst,
+  Nbhd_StoneBr = eda_df$Nbhd_StoneBr,
+  Nbhd_Timber = eda_df$Nbhd_Timber,
+  Ext_BrkFace = eda_df$Ext_BrkFace,
+  Ext_PreCast = eda_df$Ext_PreCast,
+  Cond_Norm = eda_df$Cond_Norm,
+  Cond_PosA = eda_df$Cond_PosA,
+  Cond_PosN = eda_df$Cond_PosN,
+  Cond_RRAn = eda_df$Cond_RRAn,
+  leverage, residual, StanRes, cd, Rstudent
+)
+
+B=data.frame(A)
+
+# Cutoff for Detecting Influence with Leverage
+n=length(eda_df$log_SalePrice)
+cutL=2*(4+1)/n
+which(B$leverage >cutL)
+
+# Cook’s Distance Cutoff
+cutCD=4/(n-4-1)
+which(B$cd >cutCD)
+
+A[which(B$cd >cutCD),]
+subset(B,B$cd >cutCD&B$leverage >cutL)
+
+plot(cd,main="Cook’s Distance", xlab="Observation", ylab="Cook’s Distance Cutoff
+")
+abline(h=cutCD, lty="dashed", col="red")
+
+
+```
+
+Interpretation
+
+Cook’s distance: A few cases show noticeably higher Cook’s distance values, with one observation around index 1500 exceeding the cutoff line, and two others between 2000–2500 also above the threshold. These points have a measurable influence on the fitted regression values.
+Leverage: Based on the earlier leverage check, these observations do not exceed the high-leverage threshold, so they are not extreme design points.
+Joint criterion: No observations simultaneously exceed both the Cook’s distance cutoff and the leverage threshold, meaning no data point is disproportionately influential on the model.
+
+
+```{r}
+
+plot(final_model)
+
+```
+
+Q–Q Residuals
+Most standardized residuals align closely with the 45° reference line, supporting the normal-error assumption. The lower tail bends downward and the upper tail deviates upward for cases 1499, 2181, and 2182, indicating mild heavy-tailed behaviour. Overall, the residuals are approximately normal with some influence from extreme cases.
+
+Scale-Location (Standardized residuals vs Fitted)
+The loess curve is fairly flat, suggesting roughly constant variance across fitted values. There is a slight upward trend at higher fitted values, indicating mild heteroscedasticity. The labelled cases again stand out, but the overall pattern shows acceptable homoscedasticity.
+
+Residuals vs Fitted
+Residuals are generally centered around zero with no strong systematic pattern, supporting the linearity assumption. Outliers 1499, 2181, and 2182 fall well below the main cluster, indicating unusually large negative residuals that merit attention.
+
+Residuals vs Leverage (Cook’s Distance overlay)
+Most points have low leverage, with values topping out near 0.5. The Cook’s distance contours show that observations 1499, 2181, and 2182 fall into a region of higher potential influence, though only 1499 approaches the concerning threshold. These cases have moderate leverage and large residuals, meaning they could distort coefficient estimates if not assessed carefully.
+
+Together, these plots indicate the final_model fits the data reasonably well, but a small set of influential observations (1499, 2181, 2182) drive some of the diagnostic concerns.
+
+We can consider some of them with real world stories.
+
+#Influential points 
+
+```{r}
+eda_df[c(2182, 2181, 1499), ]
+
+
+```
+What we see in these rows
+
+SalePrice: ~180K (not extreme compared to the 755K max).
+
+Gr.Liv.Area: 4676, 5095, 5642 sq ft (very high, dataset average is ~1500).
+
+Total.Bsmt.SF: ~3100–6100 (also extremely high, average is ~1050).
+
+X1stFlr.SF: ~3100–4700 (much higher than average ~1150).
+
+OverallQual: 10 (top quality, rare).
+
+Neighborhood = Edwards (unusual, because Edwards is a mid-range neighborhood; typically not where you’d expect 5000+ sq ft homes).
+
+YearBuilt 2007–2008, SaleCondition = Partial, SaleType = New → These are newly built, top-quality custom homes.
+
+GarageArea >1000, multiple cars, large deck, expensive materials (Stone veneer, Excellent quality ratings across Exter, Bsmt, Kitchen, Heating).
+
+2. Ames Dataset Context (per Kaggle data description)
+
+Most houses are between 500–2500 sq ft of living area.
+
+Gr.Liv.Area > 4000 = considered an outlier. Kaggle kernels and analyses consistently point out that houses above 4000 sq ft distort regression fits.
+
+OverallQual = 10 is very rare (less than 1% of dataset).
+
+“Partial” sales usually mean unfinished or newly constructed houses—values might not align with the normal pricing structure.
+
+3. Are these data errors?
+
+No. These records are not errors:
+
+The values make sense together (large basement, large garage, large ground floor, large total living area).
+
+Nothing contradicts the data dictionary (all values are in valid ranges).
+
+They represent legitimate extreme houses (luxury new builds).
+
+4. Why are they influential outliers?
+
+Their size (Gr.Liv.Area, Bsmt.SF, Garage.Area) is several standard deviations above the mean.
+
+SalePrice (~180K) looks too low for such massive homes with “OverallQual = 10”. Normally, homes with these features sell at the upper end (300K–500K).
+
+This mismatch between features and price makes them leverage points: they pull the regression line disproportionately.
+
+Handling Unusual Sales in the Data
+During our analysis, we identified a few properties with extreme characteristics (for example, unusually large basements or multiple fireplaces) that are very different from the majority of homes. These sales are not errors, but they are rare and atypical compared to the rest of the market.
+If we leave them in, they pull the model away from the general pricing trend and reduce prediction accuracy. By removing these extreme cases, the model gives a more reliable estimate of home values under typical market conditions. This approach ensures the model is more accurate and actionable for the majority of homes our client is interested in.
+
+# Remove influential rows 2181, 2182, 1499 and refit the final model 
+
+```{r}
+# --- Remove influential rows 2181, 2182, 1499 and refit the final model ---
+drop_ids <- c(2181, 2182, 1499)
+dropped_df = eda_df[-drop_ids, ]
+# Full model with all rows
+final_model <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+    Mas.Vnr.Area + Year.Remod.Add + X1st.Flr.SF + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot.Shape +
+    HS_1Story + HS_2.5Unf + HS_Foyer + HS_SLvl +
+    Land.Contour +
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Ext_BrkFace + Ext_PreCast +
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  data = eda_df
+)
+
+# Model after dropping the three influential rows
+final_model_drop <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+    Mas.Vnr.Area + Year.Remod.Add + X1st.Flr.SF + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot.Shape +
+    HS_1Story + HS_2.5Unf + HS_Foyer + HS_SLvl +
+    Land.Contour +
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Ext_BrkFace + Ext_PreCast +
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  data = dropped_df
+)
+
+summary(final_model_drop)
+
+```
+We are getting rid of X1st.Flr.SF ,Lot.ShapeIR3 ,Land.ContourLow , Land.ContourLvl 
+
+```{r}
+# Lot.Shape dummy variables
+dropped_df$Lot_Shape_IR2  <- ifelse(dropped_df$Lot.Shape == "IR2", 1, 0)
+dropped_df$Lot_Shape_IR3  <- ifelse(dropped_df$Lot.Shape == "IR3", 1, 0)
+dropped_df$Lot_Shape_Reg  <- ifelse(dropped_df$Lot.Shape == "Reg", 1, 0)
+
+# Land.Contour dummy variables
+dropped_df$Land_Contour_HLS <- ifelse(dropped_df$Land.Contour == "HLS", 1, 0)
+dropped_df$Land_Contour_Low <- ifelse(dropped_df$Land.Contour == "Low", 1, 0)
+dropped_df$Land_Contour_Lvl <- ifelse(dropped_df$Land.Contour == "Lvl", 1, 0)
+
+#18 variables - option 1
+final_model_drop1 <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+    Mas.Vnr.Area + Year.Remod.Add + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot_Shape_IR2 + Lot_Shape_Reg +
+    HS_1Story + HS_2.5Unf + HS_Foyer + HS_SLvl +
+    Land_Contour_HLS +
+    Nbhd_BrDale + Nbhd_ClearCr + Nbhd_CollgCr + Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + Nbhd_Timber +
+    Ext_BrkFace + Ext_PreCast +
+    Cond_Norm + Cond_PosA + Cond_PosN + Cond_RRAn,
+  data = dropped_df
+)
+
+summary(final_model_drop1)
+
+```
+# Option 2 - removing the ones with 2% significance, p value- which have e-05<e-06 - to keep the most significant ones
+
+```{r}
+final_model_drop2 <- lm(
+  log_SalePrice ~ Wood.Deck.SF + BsmtFin.SF.1 + Fireplaces +
+     Year.Remod.Add + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot_Shape_Reg +
+    HS_1Story +
+    Nbhd_Crawfor + Nbhd_GrnHill +
+    Nbhd_NoRidge + Nbhd_NridgHt + Nbhd_Somerst + Nbhd_StoneBr + 
+    Ext_BrkFace + 
+    Cond_Norm ,
+  data = dropped_df
+)
+
+summary(final_model_drop2)
+
+```
+# Option 3 - removing the ones with  p value- which have e-08 - 09<e-010 - to keep the most significant ones
+
+```{r}
+final_model_drop3 <- lm(
+  log_SalePrice ~ BsmtFin.SF.1 + Fireplaces +
+     Year.Remod.Add + log_TotalBsmt +
+    Garage.Cars + Gr.Liv.Area + Overall.Qual + Exter.Qual +
+    KQ_Fa + KQ_Gd + KQ_TA +
+    SaleCond_Normal + SaleCond_Partial + Lot_Shape_Reg +
+    HS_1Story +
+    Nbhd_Crawfor + 
+    Nbhd_NoRidge ,
+  data = dropped_df
+)
+
+summary(final_model_drop3)
+
+```
+There is not much difference between option 1 and option 2 , 
+
+
+```{r}
+
+# --- Compare coefficients ---
+coefs <- cbind(Full = coef(final_model), Drop = coef(final_model_drop3))
+pct_change <- 100 * (coefs[, "Drop"] - coefs[, "Full"]) / coefs[, "Full"]
+coef_comp <- cbind(round(coefs, 6), pct_change = round(pct_change, 2))
+
+# --- Compare fit statistics ---
+rmse <- function(e) sqrt(mean(e^2))
+metrics <- data.frame(
+  model  = c("Full","Drop"),
+  adj_r2 = c(summary(final_model)$adj.r.squared,
+             summary(final_model_drop3)$adj.r.squared),
+  AIC    = c(AIC(final_model), AIC(final_model_drop3)),
+  BIC    = c(BIC(final_model), BIC(final_model_drop3)),
+  RMSE   = c(rmse(residuals(final_model)),
+             rmse(residuals(final_model_drop3)))
+)
+
+# --- Outputs ---
+coef_comp
+metrics
+
+plot(final_model_drop3)
+```
+Dropping the 3 influential observations improved the model: higher explanatory power (Adj R²), better fit criteria (lower AIC/BIC), and lower prediction error (RMSE). This suggests those rows were distorting the regression line.
+A few observations (758, 957, 1638) still stand out with higher residuals, but they are not extreme enough to distort the regression like 2181, 2182, and 1499 did earlier. The few that remain are within an acceptable range and reflect real-world variation in housing.
+
+```{r}
+# Adding predicted and observed values (log scale)
+dropped_df$predicted_log_SalePrice <- predict(final_model_drop3)
+dropped_df$observed_log_SalePrice <- dropped_df$log_SalePrice
+
+# making a comparison table
+comparison_df = data.frame(
+  Observed = dropped_df$observed_log_SalePrice,
+  Predicted = dropped_df$predicted_log_SalePrice,
+  residuals = dropped_df$observed_log_SalePrice - dropped_df$predicted_log_SalePrice
+)
+comparison_df
+
+# residuals plot
+plot(dropped_df$observed_log_SalePrice, comparison_df$residuals, pch=19, col="blue",
+     xlab = "Fitted Values",
+     ylab  = "Residuals",
+     main= "Residuals vs Fitted")
+abline(h=0, lty="dashed", col="red")
+
+
+```
+
+```{r}
+
+# Ploting observed vs. predicted values (log scale)
+plot(dropped_df$observed_log_SalePrice,dropped_df$predicted_log_SalePrice,
+     xlab = "Observed log(SalePrice)",
+     ylab = "Predicted log(SalePrice)",
+     main = "Observed vs. Predicted Values (Log Scale)",
+     col = "blue", pch = 19)
+abline(0, 1, col = "red", lwd = 2)
+
+```
+The plots improved.
+
+
+Combined Reasoning
+
+Removing the 3 extreme houses helped coefficients stabilize.
+Before, those influential houses made the model underestimate or overestimate categories.
+Now, the effects of neighborhoods, lot shapes, and sale conditions align better with real-world housing economics:
+
+- Prime neighborhoods (NridgHt, NoRidge) → higher value.
+
+- Irregular lot shapes, poor conditions → lower value.
+
+- “Partial” sales often mean new builds not fully finished → usually higher priced.
